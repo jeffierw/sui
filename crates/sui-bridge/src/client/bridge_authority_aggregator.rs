@@ -124,6 +124,11 @@ impl GetSigsState {
             }
         }
         if self.total_ok_stake >= self.validity_threshold {
+            info!(
+                "Got enough signatures from {} validators with total_ok_stake {}",
+                self.sigs.len(),
+                self.total_ok_stake
+            );
             let signatures = self
                 .sigs
                 .iter()
@@ -217,16 +222,18 @@ async fn request_sign_bridge_action_into_certification(
     .await
     .map_err(|state| {
         error!(
-            "Failed to get enough signatures, bad stake: {}, blocklisted stake: {}, good stake: {}",
+            "Failed to get enough signatures, bad stake: {}, blocklisted stake: {}, good stake: {}, validity threshold: {}",
             state.total_bad_stake,
             state.committee.total_blocklisted_stake(),
-            state.total_ok_stake
+            state.total_ok_stake,
+            state.validity_threshold,
         );
         BridgeError::AuthoritySignatureAggregationTooManyError(format!(
-            "Failed to get enough signatures, bad stake: {}, blocklisted stake: {}, good stake: {}",
+            "Failed to get enough signatures, bad stake: {}, blocklisted stake: {}, good stake: {}, validity threshold: {}",
             state.total_bad_stake,
             state.committee.total_blocklisted_stake(),
-            state.total_ok_stake
+            state.total_ok_stake,
+            state.validity_threshold,
         ))
     })?;
     Ok(result)

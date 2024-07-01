@@ -213,9 +213,10 @@ impl CheckpointReader {
     async fn sync(&mut self) -> Result<()> {
         let backoff = backoff::ExponentialBackoff::default();
         let mut checkpoints = backoff::future::retry(backoff, || async {
-            self.read_local_files()
-                .await
-                .map_err(backoff::Error::transient)
+            self.read_local_files().await.map_err(|err| {
+                info!("transient local read error {:?}", err);
+                backoff::Error::transient(err)
+            })
         })
         .await?;
 
@@ -323,6 +324,8 @@ impl CheckpointReader {
         watcher
             .watch(&self.path, RecursiveMode::NonRecursive)
             .expect("Inotify watcher failed");
+        self.gc_processed_files(self.last_pruned_watermark)
+            .expect("Failed to clean the directory");
 
         loop {
             tokio::select! {

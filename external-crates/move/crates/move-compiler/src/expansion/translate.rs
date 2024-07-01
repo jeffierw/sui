@@ -821,6 +821,7 @@ fn module_(
         is_spec_module: _,
         name,
         members,
+        definition_mode: _,
     } = mdef;
     let attributes = flatten_attributes(context, AttributePosition::Module, attributes);
     let mut warning_filter = module_warning_filter(context, &attributes);
@@ -1087,7 +1088,8 @@ fn gate_known_attribute(context: &mut Context, loc: Loc, known: &KnownAttribute)
         | KnownAttribute::Diagnostic(_)
         | KnownAttribute::DefinesPrimitive(_)
         | KnownAttribute::External(_)
-        | KnownAttribute::Syntax(_) => (),
+        | KnownAttribute::Syntax(_)
+        | KnownAttribute::Deprecation(_) => (),
         KnownAttribute::Error(_) => {
             let pkg = context.current_package();
             context

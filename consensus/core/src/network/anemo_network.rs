@@ -8,9 +8,11 @@ use std::{
     time::Duration,
 };
 
-use anemo::rpc::Status;
-use anemo::types::response::StatusCode;
-use anemo::{types::PeerInfo, PeerId, Response};
+use anemo::{
+    rpc::Status,
+    types::{response::StatusCode, PeerInfo},
+    PeerId, Response,
+};
 use anemo_tower::{
     auth::{AllowedPeers, RequireAuthorizationLayer},
     callback::{CallbackLayer, MakeCallbackHandler, ResponseHandler},
@@ -22,7 +24,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
 use consensus_config::{AuthorityIndex, NetworkKeyPair};
-use prometheus::HistogramTimer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, warn};
@@ -34,11 +35,12 @@ use super::{
     },
     connection_monitor::{AnemoConnectionMonitor, ConnectionMonitorHandle},
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
-    metrics::NetworkRouteMetrics,
+    metrics_layer::{MetricsCallbackMaker, MetricsResponseCallback, SizedRequest, SizedResponse},
     BlockStream, NetworkClient, NetworkManager, NetworkService,
 };
 use crate::{
     block::{BlockRef, VerifiedBlock},
+    commit::CommitRange,
     context::Context,
     error::{ConsensusError, ConsensusResult},
     CommitIndex, Round,
@@ -193,18 +195,44 @@ impl NetworkClient for AnemoClient {
     async fn fetch_commits(
         &self,
         peer: AuthorityIndex,
-        start: CommitIndex,
-        end: CommitIndex,
+        commit_range: CommitRange,
         timeout: Duration,
     ) -> ConsensusResult<(Vec<Bytes>, Vec<Bytes>)> {
         let mut client = self.get_client(peer, timeout).await?;
-        let request = FetchCommitsRequest { start, end };
+        let request = FetchCommitsRequest {
+            start: commit_range.start(),
+            end: commit_range.end(),
+        };
         let response = client
             .fetch_commits(anemo::Request::new(request).with_timeout(timeout))
             .await
             .map_err(|e| ConsensusError::NetworkRequest(format!("fetch_blocks failed: {e:?}")))?;
         let response = response.into_body();
         Ok((response.commits, response.certifier_blocks))
+    }
+
+    async fn fetch_latest_blocks(
+        &self,
+        peer: AuthorityIndex,
+        authorities: Vec<AuthorityIndex>,
+        timeout: Duration,
+    ) -> ConsensusResult<Vec<Bytes>> {
+        let mut client = self.get_client(peer, timeout).await?;
+        let request = FetchLatestBlocksRequest { authorities };
+        let response = client
+            .fetch_latest_blocks(anemo::Request::new(request).with_timeout(timeout))
+            .await
+            .map_err(|e: Status| {
+                if e.status() == StatusCode::RequestTimeout {
+                    ConsensusError::NetworkRequestTimeout(format!(
+                        "fetch_latest_blocks timeout: {e:?}"
+                    ))
+                } else {
+                    ConsensusError::NetworkRequest(format!("fetch_latest_blocks failed: {e:?}"))
+                }
+            })?;
+        let body = response.into_body();
+        Ok(body.blocks)
     }
 }
 
@@ -322,7 +350,7 @@ impl<S: NetworkService> ConsensusRpc for AnemoServiceProxy<S> {
         let request = request.into_body();
         let (commits, certifier_blocks) = self
             .service
-            .handle_fetch_commits(*index, request.start, request.end)
+            .handle_fetch_commits(*index, (request.start..=request.end).into())
             .await
             .map_err(|e| {
                 anemo::rpc::Status::new_with_message(
@@ -342,6 +370,36 @@ impl<S: NetworkService> ConsensusRpc for AnemoServiceProxy<S> {
             commits,
             certifier_blocks,
         }))
+    }
+
+    async fn fetch_latest_blocks(
+        &self,
+        request: anemo::Request<FetchLatestBlocksRequest>,
+    ) -> Result<anemo::Response<FetchLatestBlocksResponse>, anemo::rpc::Status> {
+        let Some(peer_id) = request.peer_id() else {
+            return Err(anemo::rpc::Status::new_with_message(
+                anemo::types::response::StatusCode::BadRequest,
+                "peer_id not found",
+            ));
+        };
+        let index = self.peer_map.get(peer_id).ok_or_else(|| {
+            anemo::rpc::Status::new_with_message(
+                anemo::types::response::StatusCode::BadRequest,
+                "peer not found",
+            )
+        })?;
+        let body = request.into_body();
+        let blocks = self
+            .service
+            .handle_fetch_latest_blocks(*index, body.authorities)
+            .await
+            .map_err(|e| {
+                anemo::rpc::Status::new_with_message(
+                    anemo::types::response::StatusCode::BadRequest,
+                    format!("{e}"),
+                )
+            })?;
+        Ok(Response::new(FetchLatestBlocksResponse { blocks }))
     }
 }
 
@@ -403,11 +461,14 @@ impl<S: NetworkService> NetworkManager<S> for AnemoManager {
             }
         );
         let epoch_string: String = self.context.committee.epoch().to_string();
-        let inbound_network_metrics =
-            Arc::new(self.context.metrics.network_metrics.inbound.clone());
-        let outbound_network_metrics =
-            Arc::new(self.context.metrics.network_metrics.outbound.clone());
-        let quinn_connection_metrics = self.context.metrics.quinn_connection_metrics.clone();
+        let inbound_network_metrics = self.context.metrics.network_metrics.inbound.clone();
+        let outbound_network_metrics = self.context.metrics.network_metrics.outbound.clone();
+        let quinn_connection_metrics = self
+            .context
+            .metrics
+            .network_metrics
+            .quinn_connection_metrics
+            .clone();
         let all_peer_ids = self
             .context
             .committee
@@ -430,7 +491,7 @@ impl<S: NetworkService> NetworkManager<S> for AnemoManager {
                     .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
                     .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
             )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+            .layer(CallbackLayer::new(MetricsCallbackMaker::new(
                 inbound_network_metrics,
                 self.context.parameters.anemo.excessive_message_size,
             )))
@@ -446,7 +507,7 @@ impl<S: NetworkService> NetworkManager<S> for AnemoManager {
                     .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
                     .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
             )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+            .layer(CallbackLayer::new(MetricsCallbackMaker::new(
                 outbound_network_metrics,
                 self.context.parameters.anemo.excessive_message_size,
             )))
@@ -576,6 +637,50 @@ impl<S: NetworkService> NetworkManager<S> for AnemoManager {
     }
 }
 
+// Adapt MetricsCallbackMaker and MetricsResponseCallback to anemo.
+
+impl SizedRequest for anemo::Request<Bytes> {
+    fn size(&self) -> usize {
+        self.body().len()
+    }
+
+    fn route(&self) -> String {
+        self.route().to_string()
+    }
+}
+
+impl SizedResponse for anemo::Response<Bytes> {
+    fn size(&self) -> usize {
+        self.body().len()
+    }
+
+    fn error_type(&self) -> Option<String> {
+        if self.status().is_success() {
+            None
+        } else {
+            Some(self.status().to_string())
+        }
+    }
+}
+
+impl MakeCallbackHandler for MetricsCallbackMaker {
+    type Handler = MetricsResponseCallback;
+
+    fn make_handler(&self, request: &anemo::Request<bytes::Bytes>) -> Self::Handler {
+        self.handle_request(request)
+    }
+}
+
+impl ResponseHandler for MetricsResponseCallback {
+    fn on_response(self, response: &anemo::Response<bytes::Bytes>) {
+        self.on_response(response)
+    }
+
+    fn on_error<E>(self, err: &E) {
+        self.on_error(err)
+    }
+}
+
 /// Network message types.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SendBlockRequest {
@@ -612,114 +717,13 @@ pub(crate) struct FetchCommitsResponse {
     certifier_blocks: Vec<Bytes>,
 }
 
-#[derive(Clone)]
-pub(crate) struct MetricsMakeCallbackHandler {
-    metrics: Arc<NetworkRouteMetrics>,
-    /// Size in bytes above which a request or response message is considered excessively large
-    excessive_message_size: usize,
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FetchLatestBlocksRequest {
+    authorities: Vec<AuthorityIndex>,
 }
 
-impl MetricsMakeCallbackHandler {
-    pub fn new(metrics: Arc<NetworkRouteMetrics>, excessive_message_size: usize) -> Self {
-        Self {
-            metrics,
-            excessive_message_size,
-        }
-    }
-}
-
-impl MakeCallbackHandler for MetricsMakeCallbackHandler {
-    type Handler = MetricsResponseHandler;
-
-    fn make_handler(&self, request: &anemo::Request<bytes::Bytes>) -> Self::Handler {
-        let route = request.route().to_owned();
-
-        self.metrics.requests.with_label_values(&[&route]).inc();
-        self.metrics
-            .inflight_requests
-            .with_label_values(&[&route])
-            .inc();
-        let body_len = request.body().len();
-        self.metrics
-            .request_size
-            .with_label_values(&[&route])
-            .observe(body_len as f64);
-        if body_len > self.excessive_message_size {
-            warn!(
-                "Saw excessively large request with size {body_len} for {route} with peer {:?}",
-                request.peer_id()
-            );
-            self.metrics
-                .excessive_size_requests
-                .with_label_values(&[&route])
-                .inc();
-        }
-
-        let timer = self
-            .metrics
-            .request_latency
-            .with_label_values(&[&route])
-            .start_timer();
-
-        MetricsResponseHandler {
-            metrics: self.metrics.clone(),
-            timer,
-            route,
-            excessive_message_size: self.excessive_message_size,
-        }
-    }
-}
-
-pub(crate) struct MetricsResponseHandler {
-    metrics: Arc<NetworkRouteMetrics>,
-    // The timer is held on to and "observed" once dropped
-    #[allow(unused)]
-    timer: HistogramTimer,
-    route: String,
-    excessive_message_size: usize,
-}
-
-impl ResponseHandler for MetricsResponseHandler {
-    fn on_response(self, response: &anemo::Response<bytes::Bytes>) {
-        let body_len = response.body().len();
-        self.metrics
-            .response_size
-            .with_label_values(&[&self.route])
-            .observe(body_len as f64);
-        if body_len > self.excessive_message_size {
-            warn!(
-                "Saw excessively large response with size {body_len} for {} with peer {:?}",
-                self.route,
-                response.peer_id()
-            );
-            self.metrics
-                .excessive_size_responses
-                .with_label_values(&[&self.route])
-                .inc();
-        }
-
-        if !response.status().is_success() {
-            let status = response.status().to_u16().to_string();
-            self.metrics
-                .errors
-                .with_label_values(&[&self.route, &status])
-                .inc();
-        }
-    }
-
-    fn on_error<E>(self, _error: &E) {
-        self.metrics
-            .errors
-            .with_label_values(&[&self.route, "unknown"])
-            .inc();
-    }
-}
-
-impl Drop for MetricsResponseHandler {
-    fn drop(&mut self) {
-        self.metrics
-            .inflight_requests
-            .with_label_values(&[&self.route])
-            .dec();
-    }
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FetchLatestBlocksResponse {
+    // Serialized SignedBlocks.
+    blocks: Vec<Bytes>,
 }
